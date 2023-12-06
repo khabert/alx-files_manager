@@ -1,64 +1,59 @@
 import Queue from 'bull';
-import imageThumbnail from 'image-thumbnail';
-import { promises as fs } from 'fs';
-import { ObjectID } from 'mongodb';
-import dbClient from './utils/db';
+import { promises } from 'fs';
+import generateThumbnail from 'image-thumbnail';
+import dBClient from './utils/db';
+import { FilesCollection } from './utils/file';
 
-const fileQueue = new Queue('fileQueue', 'redis://127.0.0.1:6379');
-const userQueue = new Queue('userQueue', 'redis://127.0.0.1:6379');
+const { writeFile } = promises;
 
-async function thumbNail(width, localPath) {
-  const thumbnail = await imageThumbnail(localPath, { width });
-  return thumbnail;
+const THUMBNAIL_SIZES = [500, 250, 100];
+
+const fileQueue = new Queue('image-thumbnail-worker', {
+  redis: {
+    host: 'localhost',
+    port: 6379,
+  },
+});
+
+async function createAndSaveThumbnail(path, width) {
+  const thumbnail = await generateThumbnail(
+    path, { width, responseType: 'base64' },
+  );
+  const filePath = `${path}_${width}`;
+  await writeFile(filePath, Buffer.from(thumbnail, 'base64'));
 }
 
 fileQueue.process(async (job, done) => {
-  console.log('Processing...');
-  const { fileId } = job.data;
-  if (!fileId) {
-    done(new Error('Missing fileId'));
-  }
+  const { userId, fileId } = job.data;
+  if (!fileId) { done(new Error('Missing fileId')); }
+  if (!userId) { done(new Error('Missing userId')); }
 
-  const { userId } = job.data;
-  if (!userId) {
-    done(new Error('Missing userId'));
-  }
+  const filesCollection = new FilesCollection();
+  const file = await filesCollection.findUserFileById(userId, fileId, false);
+  if (!file) { done(new Error('File not found')); }
 
-  console.log(fileId, userId);
-  const files = dbClient.db.collection('files');
-  const idObject = new ObjectID(fileId);
-  files.findOne({ _id: idObject }, async (err, file) => {
-    if (!file) {
-      console.log('Not found');
-      done(new Error('File not found'));
-    } else {
-      const fileName = file.localPath;
-      const thumbnail500 = await thumbNail(500, fileName);
-      const thumbnail250 = await thumbNail(250, fileName);
-      const thumbnail100 = await thumbNail(100, fileName);
-
-      console.log('Writing files to system');
-      const image500 = `${file.localPath}_500`;
-      const image250 = `${file.localPath}_250`;
-      const image100 = `${file.localPath}_100`;
-
-      await fs.writeFile(image500, thumbnail500);
-      await fs.writeFile(image250, thumbnail250);
-      await fs.writeFile(image100, thumbnail100);
-      done();
-    }
+  THUMBNAIL_SIZES.forEach(async (size) => {
+    await createAndSaveThumbnail(file.localPath, size);
   });
+  done();
+});
+
+export const userQueue = new Queue('user-welcome-worker', {
+  redis: {
+    host: 'localhost',
+    port: 6379,
+  },
 });
 
 userQueue.process(async (job, done) => {
   const { userId } = job.data;
-  if (!userId) done(new Error('Missing userId'));
-  const users = dbClient.db.collection('users');
-  const idObject = new ObjectID(userId);
-  const user = await users.findOne({ _id: idObject });
-  if (user) {
-    console.log(`Welcome ${user.email}!`);
-  } else {
-    done(new Error('User not found'));
-  }
+  if (!userId) { done(new Error('Missing userId')); }
+
+  const user = await dBClient.findUserById(userId);
+  if (!user) { done(new Error('User not found')); }
+
+  console.log(`Welcome ${user.email}`);
+  done();
 });
+
+export default fileQueue;
